@@ -1,0 +1,6 @@
+{
+  "name": "Carrom AI Trainer",
+  "description": "An advanced assistant with full screen overlays and high-fidelity indoor board simulations to train perfect carrom bank shots and striker reflections.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,46 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Center target ring -->
+    <path
+        android:pathData="M54,54 m-28,0 a28,28 0 1,1 56,0 a28,28 0 1,1 -56,0"
+        android:strokeWidth="2.5"
+        android:strokeColor="#FFC107"
+        android:fillColor="#00000000" />
+    <!-- Outer thin target ring -->
+    <path
+        android:pathData="M54,54 m-36,0 a36,36 0 1,1 72,0 a36,36 0 1,1 -72,0"
+        android:strokeWidth="1"
+        android:strokeColor="#FFC107"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000" />
+    <!-- Aim crosshairs -->
+    <path
+        android:pathData="M54,12 L54,34 M54,74 L54,96 M12,54 L34,54 M74,54 L96,54"
+        android:strokeWidth="2"
+        android:strokeColor="#FFC107" />
+    <!-- Spark / Neon prediction lines -->
+    <path
+        android:pathData="M54,54 L85,23"
+        android:strokeWidth="1.5"
+        android:strokeColor="#00E5FF"
+        android:strokeLineCap="round"/>
+    <path
+        android:pathData="M85,23 L96,34"
+        android:strokeWidth="1.5"
+        android:strokeColor="#00E5FF"
+        android:strokeLineCap="round"/>
+    <!-- Center Striker Piece (Red) -->
+    <path
+        android:pathData="M54,54 m-10,0 a10,10 0 1,1 20,0 a10,10 0 1,1 -20,0"
+        android:fillColor="#FF3D00" />
+    <!-- Striker Inner Reflection -->
+    <path
+        android:pathData="M54,54 m-5,0 a5,5 0 1,1 10,0 a5,5 0 1,1 -10,0"
+        android:fillColor="#FF8A65" />
+    <path
+        android:pathData="M54,54 m-2,0 a2,2 0 1,1 4,0 a2,2 0 1,1 -2,0"
+        android:fillColor="#FFFFFF" />
+</vector>
