@@ -89,6 +89,29 @@ class CarromOverlayService : Service() {
     private var isAutoSuggestEnabled by mutableStateOf(true)
     private var selectedPocketIndex by mutableStateOf(-1) // -1 means Auto Select Easiest Corner
 
+    // Advanced Shot Selection in Overlay
+    private var overlayShotType by mutableStateOf(0) // 0: AI Best, 1: Direct, 2: Coin Bank (Rebound Coin), 3: Striker Cushion (Rebound Striker)
+    private var selectedSpeedMultiplier by mutableStateOf(1f) // 0.5x, 1f, 1.5f, 2f
+
+    // Live calculated recommendation storage
+    private var liveCalculatedAngle by mutableStateOf(0f)
+    private var liveCalculatedPower by mutableStateOf(0.6f)
+    private var liveCutAngleMsg by mutableStateOf("")
+    private var liveCalculatedDifficulty by mutableStateOf("EASY")
+
+    // Overlay Autoplay/Simulation States
+    private var isSimulatingAutoplay by mutableStateOf(false)
+    private var simStrikerX by mutableStateOf(0f)
+    private var simStrikerY by mutableStateOf(0f)
+    private var simStrikerVx by mutableStateOf(0f)
+    private var simStrikerVy by mutableStateOf(0f)
+    private var simCoinX by mutableStateOf(0f)
+    private var simCoinY by mutableStateOf(0f)
+    private var simCoinVx by mutableStateOf(0f)
+    private var simCoinVy by mutableStateOf(0f)
+    private var isSimStrikerPocketed by mutableStateOf(false)
+    private var isSimCoinPocketed by mutableStateOf(false)
+
     // Coins system for Aim prediction
     private var virtualCoinsLeft by mutableStateOf(50)
     private var lastDeductionTime by mutableStateOf(0L)
@@ -472,6 +495,179 @@ class CarromOverlayService : Service() {
             }
         }
 
+        // --- DYNAMIC AUTOPLAY PHYSICS SIMULATION LOOP ---
+        LaunchedEffect(isSimulatingAutoplay, selectedSpeedMultiplier) {
+            if (isSimulatingAutoplay) {
+                val friction = 0.985f
+                val stopThreshold = 0.15f
+                val density = resources.displayMetrics.density
+                val rS = 24f * density // Striker radius (density independent)
+                val rC = 24f * density // Coin radius
+                val weightS = 3f      // Striker heavier
+                val weightC = 1f      // Coin lighter
+                val eRestitution = 0.85f
+
+                // Initialize starting coords
+                simStrikerX = handleAX
+                simStrikerY = handleAY
+                simCoinX = handleCX
+                simCoinY = handleCY
+                isSimStrikerPocketed = false
+                isSimCoinPocketed = false
+
+                // Initial fire velocity based on our live calculated results
+                val angleRad = Math.toRadians(liveCalculatedAngle.toDouble())
+                val initialSpeed = (12f + liveCalculatedPower * 28f) * selectedSpeedMultiplier
+                simStrikerVx = (initialSpeed * cos(angleRad)).toFloat()
+                simStrikerVy = (initialSpeed * sin(angleRad)).toFloat()
+                simCoinVx = 0f
+                simCoinVy = 0f
+
+                while (isSimulatingAutoplay) {
+                    // Update positions
+                    if (!isSimStrikerPocketed) {
+                        simStrikerX += simStrikerVx
+                        simStrikerY += simStrikerVy
+                        simStrikerVx *= friction
+                        simStrikerVy *= friction
+                        if (kotlin.math.sqrt(simStrikerVx * simStrikerVx + simStrikerVy * simStrikerVy) < stopThreshold) {
+                            simStrikerVx = 0f
+                            simStrikerVy = 0f
+                        }
+                    }
+
+                    if (!isSimCoinPocketed) {
+                        simCoinX += simCoinVx
+                        simCoinY += simCoinVy
+                        simCoinVx *= friction
+                        simCoinVy *= friction
+                        if (kotlin.math.sqrt(simCoinVx * simCoinVx + simCoinVy * simCoinVy) < stopThreshold) {
+                            simCoinVx = 0f
+                            simCoinVy = 0f
+                        }
+                    }
+
+                    // Wall cushion rebounds
+                    if (!isSimStrikerPocketed) {
+                        if (simStrikerX - rS < handleTLX) {
+                            simStrikerX = handleTLX + rS
+                            simStrikerVx = -simStrikerVx * eRestitution
+                        } else if (simStrikerX + rS > handleBRX) {
+                            simStrikerX = handleBRX - rS
+                            simStrikerVx = -simStrikerVx * eRestitution
+                        }
+                        if (simStrikerY - rS < handleTLY) {
+                            simStrikerY = handleTLY + rS
+                            simStrikerVy = -simStrikerVy * eRestitution
+                        } else if (simStrikerY + rS > handleBRY) {
+                            simStrikerY = handleBRY - rS
+                            simStrikerVy = -simStrikerVy * eRestitution
+                        }
+                    }
+
+                    if (!isSimCoinPocketed) {
+                        if (simCoinX - rC < handleTLX) {
+                            simCoinX = handleTLX + rC
+                            simCoinVx = -simCoinVx * eRestitution
+                        } else if (simCoinX + rC > handleBRX) {
+                            simCoinX = handleBRX - rC
+                            simCoinVx = -simCoinVx * eRestitution
+                        }
+                        if (simCoinY - rC < handleTLY) {
+                            simCoinY = handleTLY + rC
+                            simCoinVy = -simCoinVy * eRestitution
+                        } else if (simCoinY + rC > handleBRY) {
+                            simCoinY = handleBRY - rC
+                            simCoinVy = -simCoinVy * eRestitution
+                        }
+                    }
+
+                    // Elastic circle-to-circle collision between virtual simulation entities
+                    if (!isSimStrikerPocketed && !isSimCoinPocketed) {
+                        val dx = simCoinX - simStrikerX
+                        val dy = simCoinY - simStrikerY
+                        val dist = kotlin.math.sqrt(dx * dx + dy * dy)
+                        val minDist = rS + rC
+                        if (dist < minDist && dist > 0.01f) {
+                            val nx = dx / dist
+                            val ny = dy / dist
+                            val rvx = simCoinVx - simStrikerVx
+                            val rvy = simCoinVy - simStrikerVy
+                            val velAlongNormal = rvx * nx + rvy * ny
+                            if (velAlongNormal < 0f) {
+                                val j = -(1f + eRestitution) * velAlongNormal / (1f / weightS + 1f / weightC)
+                                simStrikerVx -= j * nx / weightS
+                                simStrikerVy -= j * ny / weightS
+                                simCoinVx += j * nx / weightC
+                                simCoinVy += j * ny / weightC
+
+                                // Push out of overlap slightly to prevent stickiness
+                                val overlap = minDist - dist
+                                simStrikerX -= nx * overlap * 0.51f
+                                simStrikerY -= ny * overlap * 0.51f
+                                simCoinX += nx * overlap * 0.51f
+                                simCoinY += ny * overlap * 0.51f
+                            }
+                        }
+                    }
+
+                    // Pocket detection checks
+                    val currentPockets = listOf(
+                        Offset(handleTLX, handleTLY),
+                        Offset(handleBRX, handleTLY),
+                        Offset(handleTLX, handleBRY),
+                        Offset(handleBRX, handleBRY)
+                    )
+                    val pocketRadius = 24f * density
+
+                    currentPockets.forEach { p ->
+                        if (!isSimStrikerPocketed) {
+                            val dx = simStrikerX - p.x
+                            val dy = simStrikerY - p.y
+                            if (kotlin.math.sqrt(dx * dx + dy * dy) < pocketRadius * 0.82f) {
+                                isSimStrikerPocketed = true
+                                simStrikerVx = 0f
+                                simStrikerVy = 0f
+                            }
+                        }
+                        if (!isSimCoinPocketed) {
+                            val dx = simCoinX - p.x
+                            val dy = simCoinY - p.y
+                            if (kotlin.math.sqrt(dx * dx + dy * dy) < pocketRadius * 0.88f) {
+                                isSimCoinPocketed = true
+                                simCoinVx = 0f
+                                simCoinVy = 0f
+                            }
+                        }
+                    }
+
+                    // Check if everything came to rest to trigger automatic replay loop
+                    val strikerSpeed = kotlin.math.sqrt(simStrikerVx * simStrikerVx + simStrikerVy * simStrikerVy)
+                    val coinSpeed = kotlin.math.sqrt(simCoinVx * simCoinVx + simCoinVy * simCoinVy)
+                    if ((isSimStrikerPocketed || strikerSpeed < stopThreshold) && (isSimCoinPocketed || coinSpeed < stopThreshold)) {
+                        delay(1200) // Brief tactical pause
+
+                        // Reset back to handles coordinates
+                        simStrikerX = handleAX
+                        simStrikerY = handleAY
+                        simCoinX = handleCX
+                        simCoinY = handleCY
+                        isSimStrikerPocketed = false
+                        isSimCoinPocketed = false
+
+                        val actAngleRad = Math.toRadians(liveCalculatedAngle.toDouble())
+                        val actSpeed = (12f + liveCalculatedPower * 28f) * selectedSpeedMultiplier
+                        simStrikerVx = (actSpeed * cos(actAngleRad)).toFloat()
+                        simStrikerVy = (actSpeed * sin(actAngleRad)).toFloat()
+                        simCoinVx = 0f
+                        simCoinVy = 0f
+                    }
+
+                    delay(16)
+                }
+            }
+        }
+
         Canvas(modifier = Modifier.fillMaxSize()) {
             // Draw Calibrated Board Boundary (semitransparent guides)
             val rectColor = if (isCalibrating) Color(0xFFFFD54F) else Color(0xFF00E5FF).copy(alpha = 0.25f)
@@ -576,7 +772,7 @@ class CarromOverlayService : Service() {
                             )
 
                             drawCircle(
-                                color = Color(0xFFFFA000),
+                                color = Color(0xFF00E5FF),
                                 radius = 4.dp.toPx(),
                                 center = p2
                             )
@@ -584,163 +780,470 @@ class CarromOverlayService : Service() {
                     }
                 }
             } else {
-                // =============== AI AUTO-SUGGEST MODE ===============
-                var bestPocketIndex = -1
-                var bestScore = -10000f
-                var bestContactPoint = Offset(0f, 0f)
-                var bestTargetDir = Offset(0f, 0f)
-                var bestPocketOffset = Offset(0f, 0f)
+                // =============== AI AUTO-SUGGEST MODE (Multi-Configuration & Advanced Physics) ===============
+                val radiusSum = 50f
+                val candidateShots = mutableListOf<OverlayShot>()
 
-                val radiusSum = 50f // combined average radius for visual contact calculations
+                for (pocketIdx in 0 until 4) {
+                    if (selectedPocketIndex != -1 && selectedPocketIndex != pocketIdx) continue
+                    val pocket = pocketsList[pocketIdx]
 
-                for (i in 0 until 4) {
-                    if (selectedPocketIndex != -1 && selectedPocketIndex != i) continue
-
-                    val pocket = pocketsList[i]
-
-                    // Vector from pocket to coin center
+                    // ================= 1. DIRECT CUT SHOT =================
                     val pcX = handleCX - pocket.x
                     val pcY = handleCY - pocket.y
                     val pcDist = kotlin.math.sqrt(pcX * pcX + pcY * pcY)
-                    if (pcDist < 10f) continue
+                    if (pcDist >= 15f) {
+                        val pcDx = pcX / pcDist
+                        val pcDy = pcY / pcDist
 
-                    val pcDx = pcX / pcDist
-                    val pcDy = pcY / pcDist
+                        // Contact point
+                        val contactX = handleCX + pcDx * radiusSum
+                        val contactY = handleCY + pcDy * radiusSum
+                        val contactPoint = Offset(contactX, contactY)
 
-                    // Contact point = Coin + normal * radiusSum
-                    val contactX = handleCX + pcDx * radiusSum
-                    val contactY = handleCY + pcDy * radiusSum
-                    val contactPoint = Offset(contactX, contactY)
+                        // Striker line
+                        val stX = contactX - handleAX
+                        val stY = contactY - handleAY
+                        val stDist = kotlin.math.sqrt(stX * stX + stY * stY)
 
-                    // Vector from Striker to Contact point
-                    val stX = contactX - handleAX
-                    val stY = contactY - handleAY
-                    val stDist = kotlin.math.sqrt(stX * stX + stY * stY)
-                    if (stDist < 10f) continue
+                        if (stDist >= 15f) {
+                            val stDx = stX / stDist
+                            val stDy = stY / stDist
 
-                    val stDx = stX / stDist
-                    val stDy = stY / stDist
+                            val coinDirX = -pcDx
+                            val coinDirY = -pcDy
+                            val dot = stDx * coinDirX + stDy * coinDirY
 
-                    // Aim vector of the coin (to the pocket)
-                    val coinDirX = -pcDx
-                    val coinDirY = -pcDy
+                            if (dot > 0.05f) {
+                                val score = dot * 1000f - pcDist * 0.15f - stDist * 0.05f
+                                val angleRad = kotlin.math.atan2(stY, stX)
+                                val angleDeg = Math.toDegrees(angleRad.toDouble()).toFloat()
+                                val cutRad = kotlin.math.acos(dot.coerceIn(-1f, 1f))
+                                val cutDeg = Math.toDegrees(cutRad.toDouble()).toFloat()
 
-                    // Alignment check (must be hitting the correct side of the coin)
-                    val dot = stDx * coinDirX + stDy * coinDirY
+                                candidateShots.add(
+                                    OverlayShot(
+                                        type = 1,
+                                        pocketIndex = pocketIdx,
+                                        strikerPath = listOf(Offset(handleAX, handleAY), contactPoint),
+                                        coinPath = listOf(Offset(handleCX, handleCY), pocket),
+                                        angleDeg = angleDeg,
+                                        power = (0.35f + (stDist * 0.0004f) + (pcDist * 0.0006f)).coerceIn(0.25f, 0.95f),
+                                        score = score,
+                                        description = "Direct Cut Shot 🎯",
+                                        contactPoint = contactPoint,
+                                        cutAngle = cutDeg
+                                    )
+                                )
+                            }
+                        }
+                    }
 
-                    // Quality score
-                    val score = dot * 1000f - pcDist * 0.15f - stDist * 0.05f
+                    // ================= 2. COIN BANK SHOT (Coin rebounds off 1 wall) =================
+                    val walls = listOf(
+                        Pair(0, handleTLX),  // Left
+                        Pair(1, handleBRX),  // Right
+                        Pair(2, handleTLY),  // Top
+                        Pair(3, handleBRY)   // Bottom
+                    )
+                    for ((wallType, wallVal) in walls) {
+                        val mirrorPocketX = when (wallType) {
+                            0 -> 2 * handleTLX - pocket.x
+                            1 -> 2 * handleBRX - pocket.x
+                            else -> pocket.x
+                        }
+                        val mirrorPocketY = when (wallType) {
+                            2 -> 2 * handleTLY - pocket.y
+                            3 -> 2 * handleBRY - pocket.y
+                            else -> pocket.y
+                        }
+                        val cToP_X = mirrorPocketX - handleCX
+                        val cToP_Y = mirrorPocketY - handleCY
+                        val cToP_dist = kotlin.math.sqrt(cToP_X * cToP_X + cToP_Y * cToP_Y)
+                        if (cToP_dist >= 15f) {
+                            val cpDx = cToP_X / cToP_dist
+                            val cpDy = cToP_Y / cToP_dist
 
-                    // If direction is positive, a legal cut shot is geometrically possible!
-                    if (dot > 0.04f && (bestPocketIndex == -1 || score > bestScore)) {
-                        bestPocketIndex = i
-                        bestScore = score
-                        bestContactPoint = contactPoint
-                        bestTargetDir = Offset(stDx, stDy)
-                        bestPocketOffset = pocket
+                            var ix = 0f
+                            var iy = 0f
+                            var validIntersection = false
+
+                            if (wallType == 0 || wallType == 1) { // Left/Right Wall
+                                if (kotlin.math.abs(cpDx) > 0.0001f) {
+                                    val t = (wallVal - handleCX) / cpDx
+                                    if (t > 0.05f) {
+                                        ix = wallVal
+                                        iy = handleCY + t * cpDy
+                                        if (iy >= handleTLY && iy <= handleBRY) {
+                                            validIntersection = true
+                                        }
+                                    }
+                                }
+                            } else { // Top/Bottom Wall
+                                if (kotlin.math.abs(cpDy) > 0.0001f) {
+                                    val t = (wallVal - handleCY) / cpDy
+                                    if (t > 0.05f) {
+                                        ix = handleCX + t * cpDx
+                                        iy = wallVal
+                                        if (ix >= handleTLX && ix <= handleBRX) {
+                                            validIntersection = true
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (validIntersection) {
+                                val ciX = ix - handleCX
+                                val ciY = iy - handleCY
+                                val ciDist = kotlin.math.sqrt(ciX * ciX + ciY * ciY)
+                                if (ciDist >= 10f) {
+                                    val coinDirX = ciX / ciDist
+                                    val coinDirY = ciY / ciDist
+
+                                    // Strike contact point on opposite of rebound trajectory
+                                    val contactX = handleCX - coinDirX * radiusSum
+                                    val contactY = handleCY - coinDirY * radiusSum
+                                    val contactPoint = Offset(contactX, contactY)
+
+                                    val stX = contactX - handleAX
+                                    val stY = contactY - handleAY
+                                    val stDist = kotlin.math.sqrt(stX * stX + stY * stY)
+
+                                    if (stDist >= 15f) {
+                                        val stDx = stX / stDist
+                                        val stDy = stY / stDist
+                                        val dot = stDx * coinDirX + stDy * coinDirY
+
+                                        if (dot > 0.15f) {
+                                            val ipDist = kotlin.math.sqrt((pocket.x - ix) * (pocket.x - ix) + (pocket.y - iy) * (pocket.y - iy))
+                                            val totalDistance = ciDist + ipDist
+                                            val score = dot * 800f - totalDistance * 0.12f - stDist * 0.04f - 80f
+                                            val angleRad = kotlin.math.atan2(stY, stX)
+                                            val angleDeg = Math.toDegrees(angleRad.toDouble()).toFloat()
+                                            val cutRad = kotlin.math.acos(dot.coerceIn(-1f, 1f))
+                                            val cutDeg = Math.toDegrees(cutRad.toDouble()).toFloat()
+
+                                            candidateShots.add(
+                                                OverlayShot(
+                                                    type = 2,
+                                                    pocketIndex = pocketIdx,
+                                                    strikerPath = listOf(Offset(handleAX, handleAY), contactPoint),
+                                                    coinPath = listOf(Offset(handleCX, handleCY), Offset(ix, iy), pocket),
+                                                    angleDeg = angleDeg,
+                                                    power = (0.50f + (stDist * 0.0004f) + (totalDistance * 0.0008f)).coerceIn(0.40f, 0.98f),
+                                                    score = score,
+                                                    description = "Coin Bank Shot 📐",
+                                                    contactPoint = contactPoint,
+                                                    cutAngle = cutDeg
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ================= 3. STRIKER CUSHION REBOUND (Striker rebounds off 1 wall) =================
+                    if (pcDist >= 15f) {
+                        val pcDx = pcX / pcDist
+                        val pcDy = pcY / pcDist
+                        val contactX = handleCX + pcDx * radiusSum
+                        val contactY = handleCY + pcDy * radiusSum
+                        val contactPoint = Offset(contactX, contactY)
+
+                        val strikerWalls = listOf(
+                            Pair(0, handleTLX),  // Left
+                            Pair(1, handleBRX),  // Right
+                            Pair(2, handleTLY),  // Top
+                            Pair(3, handleBRY)   // Bottom
+                        )
+                        for ((wallType, wallVal) in strikerWalls) {
+                            val mirrorTargetX = when (wallType) {
+                                0 -> 2 * handleTLX - contactX
+                                1 -> 2 * handleBRX - contactX
+                                else -> contactX
+                            }
+                            val mirrorTargetY = when (wallType) {
+                                2 -> 2 * handleTLY - contactY
+                                3 -> 2 * handleBRY - contactY
+                                else -> contactY
+                            }
+                            val sToT_X = mirrorTargetX - handleAX
+                            val sToT_Y = mirrorTargetY - handleAY
+                            val sToT_dist = kotlin.math.sqrt(sToT_X * sToT_X + sToT_Y * sToT_Y)
+                            if (sToT_dist >= 15f) {
+                                val sToT_dx = sToT_X / sToT_dist
+                                val sToT_dy = sToT_Y / sToT_dist
+
+                                var ix = 0f
+                                var iy = 0f
+                                var validIntersection = false
+
+                                if (wallType == 0 || wallType == 1) { // Left/Right
+                                    if (kotlin.math.abs(sToT_dx) > 0.0001f) {
+                                        val t = (wallVal - handleAX) / sToT_dx
+                                        if (t > 0.05f) {
+                                            ix = wallVal
+                                            iy = handleAY + t * sToT_dy
+                                            if (iy >= handleTLY && iy <= handleBRY) {
+                                                validIntersection = true
+                                            }
+                                        }
+                                    }
+                                } else { // Top/Bottom
+                                    if (kotlin.math.abs(sToT_dy) > 0.0001f) {
+                                        val t = (wallVal - handleAY) / sToT_dy
+                                        if (t > 0.05f) {
+                                            ix = handleAX + t * sToT_dx
+                                            iy = wallVal
+                                            if (ix >= handleTLX && ix <= handleBRX) {
+                                                validIntersection = true
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (validIntersection) {
+                                    val isToTX = contactPoint.x - ix
+                                    val isToTY = contactPoint.y - iy
+                                    val isToTdist = kotlin.math.sqrt(isToTX * isToTX + isToTY * isToTY)
+                                    if (isToTdist >= 10f) {
+                                        val colDirX = isToTX / isToTdist
+                                        val colDirY = isToTY / isToTdist
+
+                                        val coinDirX = -pcDx
+                                        val coinDirY = -pcDy
+                                        val dot = colDirX * coinDirX + colDirY * coinDirY
+
+                                        if (dot > 0.15f) {
+                                            val iToSDist = kotlin.math.sqrt((ix - handleAX) * (ix - handleAX) + (iy - handleAY) * (iy - handleAY))
+                                            val totalStrikerDistance = iToSDist + isToTdist
+                                            val score = dot * 800f - pcDist * 0.12f - totalStrikerDistance * 0.05f - 100f
+                                            val angleRad = kotlin.math.atan2(iy - handleAY, ix - handleAX)
+                                            val angleDeg = Math.toDegrees(angleRad.toDouble()).toFloat()
+                                            val cutRad = kotlin.math.acos(dot.coerceIn(-1f, 1f))
+                                            val cutDeg = Math.toDegrees(cutRad.toDouble()).toFloat()
+
+                                            candidateShots.add(
+                                                OverlayShot(
+                                                    type = 3,
+                                                    pocketIndex = pocketIdx,
+                                                    strikerPath = listOf(Offset(handleAX, handleAY), Offset(ix, iy), contactPoint),
+                                                    coinPath = listOf(Offset(handleCX, handleCY), pocket),
+                                                    angleDeg = angleDeg,
+                                                    power = (0.55f + (totalStrikerDistance * 0.0005f) + (pcDist * 0.0008f)).coerceIn(0.45f, 0.98f),
+                                                    score = score,
+                                                    description = "Striker Cushion Rebound 🦘",
+                                                    contactPoint = contactPoint,
+                                                    cutAngle = cutDeg
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
-                if (bestPocketIndex != -1 && virtualCoinsLeft > 0) {
-                    suggestionStatusText = when(bestPocketIndex) {
-                        0 -> "🎯 Target: Top-Left Corner"
-                        1 -> "🎯 Target: Top-Right Corner"
-                        2 -> "🎯 Target: Bottom-Left Corner"
-                        else -> "🎯 Target: Bottom-Right Corner"
+                // Filter candidates by overlayShotType if not 0 (AI Best)
+                val filteredShots = if (overlayShotType == 0) {
+                    candidateShots
+                } else {
+                    candidateShots.filter { it.type == overlayShotType }
+                }
+
+                val bestShot = filteredShots.maxByOrNull { it.score }
+
+                if (bestShot != null && virtualCoinsLeft > 0) {
+                    val pLabel = when(bestShot.pocketIndex) {
+                        0 -> "Top-Left Corner"
+                        1 -> "Top-Right Corner"
+                        2 -> "Bottom-Left Corner"
+                        else -> "Bottom-Right Corner"
+                    }
+                    val shotTypeTitle = when(bestShot.type) {
+                        1 -> "Direct Cut"
+                        2 -> "Coin Bank Rebound"
+                        else -> "Cushion Rebound"
                     }
 
-                    val strikerStart = Offset(handleAX, handleAY)
+                    suggestionStatusText = "🎯 $shotTypeTitle: $pLabel"
 
-                    // 1. Draw Striker to Contact Point Line (Teal/Blue)
-                    drawLine(
-                        color = Color(0xFF00E5FF),
-                        start = strikerStart,
-                        end = bestContactPoint,
-                        strokeWidth = 3.dp.toPx()
-                    )
+                    // Store parameters for autoplay access
+                    liveCalculatedAngle = bestShot.angleDeg
+                    liveCalculatedPower = bestShot.power
+                    liveCutAngleMsg = "Angle: ${(bestShot.cutAngle).toInt()}°"
 
-                    drawLine(
-                        color = Color(0xFF00E5FF).copy(alpha = 0.25f),
-                        start = strikerStart,
-                        end = bestContactPoint,
-                        strokeWidth = 9.dp.toPx()
-                    )
+                    liveCalculatedDifficulty = when {
+                        bestShot.cutAngle < 15f && bestShot.type == 1 -> "EASY ⭐"
+                        bestShot.cutAngle < 35f || bestShot.type == 1 -> "MEDIUM ⭐⭐"
+                        else -> "HARD ⭐⭐⭐"
+                    }
 
-                    // Interactive animation on striker alignment path
-                    val sToCDist = kotlin.math.sqrt((bestContactPoint.x - handleAX) * (bestContactPoint.x - handleAX) + (bestContactPoint.y - handleAY) * (bestContactPoint.y - handleAY))
-                    if (sToCDist > 5f) {
-                        val progress = (System.currentTimeMillis() % 2000) / 2000f
-                        drawCircle(
-                            color = Color.White,
-                            radius = 4.5f.dp.toPx(),
-                            center = Offset(
-                                handleAX + (bestContactPoint.x - handleAX) * progress,
-                                handleAY + (bestContactPoint.y - handleAY) * progress
+                    // =============== DRAW THE HIGHEST FIDELITY GUIDELINES ===============
+                    // 1. Draw Striker Path
+                    val sPath = bestShot.strikerPath
+                    if (sPath.size > 1) {
+                        val strokeColor = when(bestShot.type) {
+                            1 -> Color(0xFF00E5FF) // Teal Cyan
+                            2 -> Color(0xFF00FFCC)
+                            else -> Color(0xFFFF9800) // Deep Orange
+                        }
+                        
+                        for (idx in 0 until sPath.size - 1) {
+                            drawLine(
+                                color = strokeColor,
+                                start = sPath[idx],
+                                end = sPath[idx + 1],
+                                strokeWidth = 3.dp.toPx()
                             )
-                        )
+                            drawLine(
+                                color = strokeColor.copy(alpha = 0.22f),
+                                start = sPath[idx],
+                                end = sPath[idx + 1],
+                                strokeWidth = 9.dp.toPx()
+                            )
+                        }
+
+                        // Drawing strike visual impulse animation on striker path
+                        val firstSegmentDist = kotlin.math.sqrt((sPath[1].x - sPath[0].x) * (sPath[1].x - sPath[0].x) + (sPath[1].y - sPath[0].y) * (sPath[1].y - sPath[0].y))
+                        if (firstSegmentDist > 5f) {
+                            val progress = (System.currentTimeMillis() % 1600) / 1600f
+                            drawCircle(
+                                color = Color.White,
+                                radius = 4.5f.dp.toPx(),
+                                center = Offset(
+                                    sPath[0].x + (sPath[1].x - sPath[0].x) * progress,
+                                    sPath[0].y + (sPath[1].y - sPath[0].y) * progress
+                                )
+                            )
+                        }
                     }
 
-                    // 2. Draw Ghost Striker circle at collision position
+                    // 2. Draw Ghost Striker at contact point
+                    val gContact = bestShot.contactPoint
                     drawCircle(
                         color = Color(0xFF00E5FF).copy(alpha = 0.12f),
                         radius = 24.dp.toPx(),
-                        center = bestContactPoint
+                        center = gContact
                     )
                     drawCircle(
                         color = Color(0xFF00E5FF).copy(alpha = 0.5f),
                         radius = 24.dp.toPx(),
-                        center = bestContactPoint,
+                        center = gContact,
                         style = Stroke(
                             width = 1.5.dp.toPx(),
                             pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f)
                         )
                     )
-
                     drawCircle(
                         color = Color.White,
                         radius = 3.dp.toPx(),
-                        center = bestContactPoint
+                        center = gContact
                     )
 
-                    // 3. Draw Coin's Path to Chosen Pocket (Emerald Green)
-                    val coinStart = Offset(handleCX, handleCY)
-                    drawLine(
-                        color = Color(0xFF00E676),
-                        start = coinStart,
-                        end = bestPocketOffset,
-                        strokeWidth = 3.dp.toPx()
-                    )
-                    drawLine(
-                        color = Color(0xFF00E676).copy(alpha = 0.25f),
-                        start = coinStart,
-                        end = bestPocketOffset,
-                        strokeWidth = 9.dp.toPx()
-                    )
+                    // 3. Draw Coin Path
+                    val cPath = bestShot.coinPath
+                    if (cPath.size > 1) {
+                        val coinStrokeColor = if (bestShot.type == 2) Color(0xFFFFD54F) else Color(0xFF00E676) // Yellow for bank coin, Green for direct
+                        for (idx in 0 until cPath.size - 1) {
+                            drawLine(
+                                color = coinStrokeColor,
+                                start = cPath[idx],
+                                end = cPath[idx + 1],
+                                strokeWidth = 3.dp.toPx()
+                            )
+                            drawLine(
+                                color = coinStrokeColor.copy(alpha = 0.22f),
+                                start = cPath[idx],
+                                end = cPath[idx + 1],
+                                strokeWidth = 9.dp.toPx()
+                            )
+                        }
+                    }
 
                     // 4. Draw Extended Aim guide ray
-                    val extEndX = bestContactPoint.x + bestTargetDir.x * 250f
-                    val extEndY = bestContactPoint.y + bestTargetDir.y * 250f
+                    val aimDirX = cos(Math.toRadians(bestShot.angleDeg.toDouble())).toFloat()
+                    val aimDirY = sin(Math.toRadians(bestShot.angleDeg.toDouble())).toFloat()
+                    val extEndX = sPath.last().x + aimDirX * 180f
+                    val extEndY = sPath.last().y + aimDirY * 180f
                     drawLine(
                         color = Color(0xFFFFD54F),
-                        start = bestContactPoint,
+                        start = sPath.last(),
                         end = Offset(extEndX, extEndY),
                         strokeWidth = 1.5.dp.toPx(),
                         pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 10f), dashOffset)
                     )
+
                 } else {
                     if (virtualCoinsLeft <= 0) {
                         suggestionStatusText = "🪙 0 Coins left! Click Refill."
                     } else {
-                        suggestionStatusText = "⚠️ Pocket blocked (Extreme angle!)"
+                        suggestionStatusText = "⚠️ Selected shot blocked/impossible"
                     }
                     
-                    // Simple red link to show unreachable vector
+                    liveCalculatedDifficulty = "BLOCKED ❌"
+                    liveCutAngleMsg = "N/A"
+
+                    // Flat red warning link
                     drawLine(
                         color = Color(0xFFFF5252).copy(alpha = 0.5f),
                         start = Offset(handleAX, handleAY),
                         end = Offset(handleCX, handleCY),
                         strokeWidth = 2.dp.toPx(),
                         pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
+                    )
+                }
+            }
+
+            // ================= 5. DRAW ACTIVE AUTOPLAY SIMULATION OVERLAY ITEMS =================
+            if (isSimulatingAutoplay) {
+                val density = resources.displayMetrics.density
+                val strokeW = 2.dp.toPx()
+                val rS = 24f * density
+                val rC = 24f * density
+
+                // Simulating striker (Teal Cyan neon)
+                if (!isSimStrikerPocketed) {
+                    drawCircle(
+                        color = Color(0xFF00E5FF).copy(alpha = 0.35f),
+                        radius = rS,
+                        center = Offset(simStrikerX, simStrikerY)
+                    )
+                    drawCircle(
+                        color = Color(0xFF00E5FF),
+                        radius = rS,
+                        center = Offset(simStrikerX, simStrikerY),
+                        style = Stroke(width = strokeW)
+                    )
+                    // Inner "S" core
+                    drawCircle(
+                        color = Color.White,
+                        radius = 8.dp.toPx(),
+                        center = Offset(simStrikerX, simStrikerY)
+                    )
+                }
+
+                // Simulating coin (Green neon)
+                if (!isSimCoinPocketed) {
+                    drawCircle(
+                        color = Color(0xFF00E676).copy(alpha = 0.35f),
+                        radius = rC,
+                        center = Offset(simCoinX, simCoinY)
+                    )
+                    drawCircle(
+                        color = Color(0xFF00E676),
+                        radius = rC,
+                        center = Offset(simCoinX, simCoinY),
+                        style = Stroke(width = strokeW)
+                    )
+                    // Inner "C" core
+                    drawCircle(
+                        color = Color.White,
+                        radius = 8.dp.toPx(),
+                        center = Offset(simCoinX, simCoinY)
                     )
                 }
             }
@@ -754,18 +1257,18 @@ class CarromOverlayService : Service() {
     ) {
         val brush = Brush.verticalGradient(
             colors = listOf(
-                Color(0xFA1E1F28),
-                Color(0xFA0E0F14)
+                Color(0xFA14151F),
+                Color(0xFA08090E)
             )
         )
 
         Card(
             modifier = Modifier
-                .width(230.dp)
+                .width(240.dp)
                 .border(
                     1.5.dp,
                     Brush.linearGradient(
-                        colors = listOf(Color(0xFF00E5FF).copy(alpha = 0.5f), Color(0xFFFFD54F).copy(alpha = 0.5f))
+                        colors = listOf(Color(0xFF00E5FF).copy(alpha = 0.6f), Color(0xFF00E676).copy(alpha = 0.3f))
                     ),
                     RoundedCornerShape(16.dp)
                 )
@@ -923,9 +1426,10 @@ class CarromOverlayService : Service() {
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "AI Auto-Suggest",
+                                    text = "AI Auto-Suggest Mode",
                                     color = Color.White,
-                                    fontSize = 12.sp
+                                    fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.Medium
                                 )
                                 Switch(
                                     checked = isAutoSuggestEnabled,
@@ -950,7 +1454,7 @@ class CarromOverlayService : Service() {
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "Calibrate Table",
+                                    text = "Calibrate Table Grid",
                                     color = Color.White,
                                     fontSize = 12.sp
                                 )
@@ -970,17 +1474,70 @@ class CarromOverlayService : Service() {
                                 )
                             }
 
-                            // IF AI Suggestion is active, render pocket selector buttons
+                            // IF AI Suggestion is active, render pocket selector buttons and advanced controls
                             if (isAutoSuggestEnabled) {
+                                Divider(color = Color.White.copy(alpha = 0.08f))
+
+                                // Shot Configuration Filter Caps (Tab Strip)
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                     Text(
-                                        text = "Aim Target Pocket:",
+                                        text = "Solve Shot Type Configuration:",
                                         color = Color.White.copy(alpha = 0.7f),
                                         fontSize = 10.5.sp
                                     )
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                    ) {
+                                        val filterTypes = listOf("AI Best", "Direct", "Bank", "Cushion")
+                                        filterTypes.forEachIndexed { idx, title ->
+                                            val isSel = overlayShotType == idx
+                                            val tabBgColor = when {
+                                                isSel && idx == 0 -> Color(0xFF00E5FF).copy(alpha = 0.25f)
+                                                isSel -> Color(0xFF00E676).copy(alpha = 0.25f)
+                                                else -> Color.White.copy(alpha = 0.06f)
+                                            }
+                                            Box(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .clip(RoundedCornerShape(6.dp))
+                                                    .background(tabBgColor)
+                                                    .border(
+                                                        1.dp,
+                                                        if (isSel) (if (idx==0) Color(0xFF00E5FF) else Color(0xFF00E676)) else Color.Transparent,
+                                                        RoundedCornerShape(6.dp)
+                                                    )
+                                                    .clickable {
+                                                        overlayShotType = idx
+                                                        if (virtualCoinsLeft > 0) {
+                                                            virtualCoinsLeft--
+                                                            suggestionStatusText = "Solving configurations..."
+                                                        }
+                                                    }
+                                                    .padding(vertical = 5.dp),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Text(
+                                                    text = title,
+                                                    color = if (isSel) Color.White else Color.LightGray,
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Interactive Pocket Selector Action Header
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(
+                                        text = "Aim Target Pocket Profile:",
+                                        color = Color.White.copy(alpha = 0.7f),
+                                        fontSize = 10.5.sp
+                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(3.dp)
                                     ) {
                                         val pocketsLabels = listOf("Auto", "TL", "TR", "BL", "BR")
                                         val indices = listOf(-1, 0, 1, 2, 3)
@@ -991,19 +1548,19 @@ class CarromOverlayService : Service() {
                                                     .weight(1f)
                                                     .clip(RoundedCornerShape(6.dp))
                                                     .background(
-                                                        if (isSelected) Color(0xFF00E676).copy(alpha = 0.25f)
+                                                        if (isSelected) Color(0xFFFF9800).copy(alpha = 0.25f)
                                                         else Color.White.copy(alpha = 0.08f)
                                                     )
                                                     .border(
                                                         1.dp,
-                                                        if (isSelected) Color(0xFF00E676) else Color.Transparent,
+                                                        if (isSelected) Color(0xFFFF9800) else Color.Transparent,
                                                         RoundedCornerShape(6.dp)
                                                     )
                                                     .clickable {
                                                         selectedPocketIndex = i
                                                         if (virtualCoinsLeft > 0) {
                                                             virtualCoinsLeft--
-                                                            suggestionStatusText = "Applying formula..."
+                                                            suggestionStatusText = "Restructuring math..."
                                                         }
                                                     }
                                                     .padding(vertical = 4.dp),
@@ -1011,7 +1568,7 @@ class CarromOverlayService : Service() {
                                             ) {
                                                 Text(
                                                     text = pocketsLabels[index],
-                                                    color = if (isSelected) Color(0xFF00E676) else Color.White,
+                                                    color = if (isSelected) Color(0xFFFF9800) else Color.White,
                                                     fontSize = 9.sp,
                                                     fontWeight = FontWeight.Bold
                                                 )
@@ -1019,6 +1576,102 @@ class CarromOverlayService : Service() {
                                         }
                                     }
                                 }
+
+                                Divider(color = Color.White.copy(alpha = 0.08f))
+
+                                // DYNAMIC LIVE SHOT STATS HUD
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color.White.copy(alpha = 0.05f))
+                                        .padding(8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(text = "HUD RECS", color = Color(0xFF00E5FF), fontSize = 8.sp, fontWeight = FontWeight.Black)
+                                        Text(text = liveCutAngleMsg.ifEmpty { "N/A" }, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        Text(text = "Rec Power: ${(liveCalculatedPower * 100).toInt()}%", color = Color.LightGray, fontSize = 9.sp)
+                                    }
+                                    Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(text = "DIFFICULTY", color = Color(0xFFFFD54F), fontSize = 8.sp, fontWeight = FontWeight.Black)
+                                        Text(
+                                            text = liveCalculatedDifficulty,
+                                            color = if (liveCalculatedDifficulty.contains("EASY")) Color(0xFF00E676) else if (liveCalculatedDifficulty.contains("MEDIUM")) Color(0xFFFFD54F) else Color(0xFFFF5252),
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+
+                                // OVERLAY VIRTUAL AUTOPLAY ENGINE
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color(0xFF00E5FF).copy(alpha = 0.05f))
+                                        .border(1.dp, Color(0xFF00E5FF).copy(alpha = 0.15f), RoundedCornerShape(8.dp))
+                                        .padding(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(text = "🛡️ Live Autoplay Simulator", color = Color.White, fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                                        
+                                        // Simulator toggle button
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(4.dp))
+                                                .background(if (isSimulatingAutoplay) Color(0xFFFF5252).copy(alpha = 0.25f) else Color(0xFF00E676).copy(alpha = 0.25f))
+                                                .border(1.dp, if (isSimulatingAutoplay) Color(0xFFFF5252) else Color(0xFF00E676), RoundedCornerShape(4.dp))
+                                                .clickable { isSimulatingAutoplay = !isSimulatingAutoplay }
+                                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        ) {
+                                            Text(
+                                                text = if (isSimulatingAutoplay) "Stop" else "Play",
+                                                color = Color.White,
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+
+                                    // Autoplay Speed Controls
+                                    Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(text = "Playback Speed", color = Color.LightGray, fontSize = 9.sp)
+                                            Text(text = "${selectedSpeedMultiplier}x", color = Color(0xFFFFD54F), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            val speeds = listOf(0.5f, 1f, 1.5f, 2f)
+                                            speeds.forEach { s ->
+                                                val isSelectedSpeed = selectedSpeedMultiplier == s
+                                                Box(
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .clip(RoundedCornerShape(4.dp))
+                                                        .background(if (isSelectedSpeed) Color(0xFF00E5FF).copy(alpha = 0.25f) else Color.White.copy(alpha = 0.05f))
+                                                        .clickable { selectedSpeedMultiplier = s }
+                                                        .padding(vertical = 3.dp),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Text(text = "${s}x", color = if (isSelectedSpeed) Color.White else Color.Gray, fontSize = 8.5.sp, fontWeight = FontWeight.Bold)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                             } else {
                                 // Manual bounce wall prediction toggle & strength slider
                                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1086,7 +1739,7 @@ class CarromOverlayService : Service() {
                             ) {
                                 Text(
                                     text = if (isAutoSuggestEnabled) 
-                                        "Aim 'S' with your striker, target coin with 'C'. 'TL'/'BR' adjust board corners!"
+                                        "Drag 'S' handle dynamically to track live striker movement! 'C' handle positions target coin."
                                     else
                                         "Align 'S' with your game's striker and 'T' with target coin.",
                                     color = Color(0xFFB2EBF2),
@@ -1139,3 +1792,16 @@ class CarromOverlayService : Service() {
         override val savedStateRegistry: SavedStateRegistry get() = savedStateRegistryController.savedStateRegistry
     }
 }
+
+class OverlayShot(
+    val type: Int, // 1: Direct, 2: Coin Bank, 3: Striker Cushion
+    val pocketIndex: Int,
+    val strikerPath: List<androidx.compose.ui.geometry.Offset>,
+    val coinPath: List<androidx.compose.ui.geometry.Offset>,
+    val angleDeg: Float,
+    val power: Float,
+    val score: Float,
+    val description: String,
+    val contactPoint: androidx.compose.ui.geometry.Offset,
+    val cutAngle: Float
+)
