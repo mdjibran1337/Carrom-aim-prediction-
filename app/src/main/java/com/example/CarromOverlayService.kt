@@ -19,6 +19,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -113,9 +114,20 @@ class CarromOverlayService : Service() {
     private var isSimCoinPocketed by mutableStateOf(false)
 
     // Coins system for Aim prediction
-    private var virtualCoinsLeft by mutableStateOf(50)
+    private var virtualCoinsLeft by mutableStateOf(999) // Clamped to unlimited/infinite balance
     private var lastDeductionTime by mutableStateOf(0L)
     private var suggestionStatusText by mutableStateOf("AI Auto-Suggest Ready")
+
+    // Multiple Coins Support and Editing State variables
+    private val activeBoardCoins = mutableStateListOf<CustomBoardCoin>()
+    private var isCoinEditMode by mutableStateOf(false)
+    private var activeFilterColor by mutableStateOf("WHITE") // "WHITE", "BLACK", "RED", "ALL"
+    
+    // Left side HUD player indicator team status
+    private var leftIndicatorActiveTeam by mutableStateOf("WHITE") // WHITE means White coins are mine (default)
+
+    // Active AI Best Shot solved state
+    private var activeBestShot by mutableStateOf<OverlayShot?>(null)
 
     // Floating Views
     private var canvasView: ComposeView? = null
@@ -144,6 +156,33 @@ class CarromOverlayService : Service() {
 
         createNotificationChannel()
         startForegroundNotification()
+        
+        // Populates standard pattern of White, Black, and Red coins
+        setupDefaultBoardCoins()
+    }
+
+    private fun setupDefaultBoardCoins() {
+        activeBoardCoins.clear()
+        // Center of the board in typical mobile layouts
+        val cx = 500f
+        val cy = 800f
+        val r = 70f
+        
+        // Queen queen red coin at core center
+        activeBoardCoins.add(CustomBoardCoin(cx, cy, "RED"))
+        
+        // 4 White coins
+        activeBoardCoins.add(CustomBoardCoin(cx - r, cy, "WHITE"))
+        activeBoardCoins.add(CustomBoardCoin(cx + r, cy, "WHITE"))
+        activeBoardCoins.add(CustomBoardCoin(cx, cy - r, "WHITE"))
+        activeBoardCoins.add(CustomBoardCoin(cx, cy + r, "WHITE"))
+        
+        // 4 Black coins
+        val offsetDiag = r * 0.707f
+        activeBoardCoins.add(CustomBoardCoin(cx - offsetDiag, cy - offsetDiag, "BLACK"))
+        activeBoardCoins.add(CustomBoardCoin(cx + offsetDiag, cy - offsetDiag, "BLACK"))
+        activeBoardCoins.add(CustomBoardCoin(cx - offsetDiag, cy + offsetDiag, "BLACK"))
+        activeBoardCoins.add(CustomBoardCoin(cx + offsetDiag, cy + offsetDiag, "BLACK"))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -274,10 +313,31 @@ class CarromOverlayService : Service() {
         if (!isAutoSuggestEnabled) return
         val now = System.currentTimeMillis()
         if (now - lastDeductionTime > 3000L) { // 3 seconds interval
-            if (virtualCoinsLeft > 0) {
-                virtualCoinsLeft--
-                lastDeductionTime = now
+            // Clamps trainer system credits to unlimited so user never gets locked
+            if (virtualCoinsLeft < 999) {
+                virtualCoinsLeft = 999
             }
+            lastDeductionTime = now
+        }
+    }
+
+    private fun updateCanvasTouchable(isTouchable: Boolean) {
+        val windowManagerRef = windowManager ?: return
+        val currentView = canvasView ?: return
+        val currentParams = paramsCanvas ?: return
+
+        if (isTouchable) {
+            // Remove FLAG_NOT_TOUCHABLE so it can detect clicks/gestures
+            currentParams.flags = currentParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        } else {
+            // Add FLAG_NOT_TOUCHABLE so details pass through to any background application/game
+            currentParams.flags = currentParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
+
+        try {
+            windowManagerRef.updateViewLayout(currentView, currentParams)
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -485,6 +545,11 @@ class CarromOverlayService : Service() {
     fun OverlayCanvasComponent() {
         if (!isOverlayVisible) return
 
+        // Sync native window touch flags whenever edit mode is toggled
+        LaunchedEffect(isCoinEditMode) {
+            updateCanvasTouchable(isCoinEditMode)
+        }
+
         // Visual animation for simulated shot speed
         var dashOffset by remember { mutableStateOf(0f) }
         LaunchedEffect(simulatedPower) {
@@ -507,11 +572,13 @@ class CarromOverlayService : Service() {
                 val weightC = 1f      // Coin lighter
                 val eRestitution = 0.85f
 
-                // Initialize starting coords
+                // Initialize starting coords: target the AI suggested coin or fallback to movable handle C
                 simStrikerX = handleAX
                 simStrikerY = handleAY
-                simCoinX = handleCX
-                simCoinY = handleCY
+                
+                val targetCoinOffset = activeBestShot?.coinPos ?: Offset(handleCX, handleCY)
+                simCoinX = targetCoinOffset.x
+                simCoinY = targetCoinOffset.y
                 isSimStrikerPocketed = false
                 isSimCoinPocketed = false
 
@@ -645,13 +712,33 @@ class CarromOverlayService : Service() {
                     val strikerSpeed = kotlin.math.sqrt(simStrikerVx * simStrikerVx + simStrikerVy * simStrikerVy)
                     val coinSpeed = kotlin.math.sqrt(simCoinVx * simCoinVx + simCoinVy * simCoinVy)
                     if ((isSimStrikerPocketed || strikerSpeed < stopThreshold) && (isSimCoinPocketed || coinSpeed < stopThreshold)) {
+                        
+                        // "coins ko auto deduct ho" - Auto deduct the target coin if it was pocketed!
+                        if (isSimCoinPocketed) {
+                            val activeBestShotRef = activeBestShot
+                            if (activeBestShotRef != null) {
+                                val targetToDeduct = activeBestShotRef.coinPos
+                                if (targetToDeduct != null) {
+                                    val coinToRemove = activeBoardCoins.find {
+                                        kotlin.math.sqrt((it.x - targetToDeduct.x) * (it.x - targetToDeduct.x) + (it.y - targetToDeduct.y) * (it.y - targetToDeduct.y)) < 15f
+                                    }
+                                    if (coinToRemove != null) {
+                                        activeBoardCoins.remove(coinToRemove)
+                                        suggestionStatusText = "Coin auto-deducted after simulated pocketing! 🎉"
+                                    }
+                                }
+                            }
+                        }
+
                         delay(1200) // Brief tactical pause
 
-                        // Reset back to handles coordinates
+                        // Reinitialize back to handles coordinates
                         simStrikerX = handleAX
                         simStrikerY = handleAY
-                        simCoinX = handleCX
-                        simCoinY = handleCY
+                        
+                        val nextTargetOffset = activeBestShot?.coinPos ?: Offset(handleCX, handleCY)
+                        simCoinX = nextTargetOffset.x
+                        simCoinY = nextTargetOffset.y
                         isSimStrikerPocketed = false
                         isSimCoinPocketed = false
 
@@ -705,6 +792,99 @@ class CarromOverlayService : Service() {
                     center = p
                 )
             }
+
+            // ================= DRAW CUSTOM BOARD COINS ("activeBoardCoins") =================
+            activeBoardCoins.forEach { coin ->
+                val coinColor = when (coin.colorType) {
+                    "WHITE" -> Color(0xFFECEFF1)
+                    "BLACK" -> Color(0xFF263238)
+                    else -> Color(0xFFFF3D00) // RED Queen
+                }
+                val strokeColor = when (coin.colorType) {
+                    "WHITE" -> Color.White
+                    "BLACK" -> Color.Black
+                    else -> Color(0xFFFF8A65)
+                }
+                val density = resources.displayMetrics.density
+                val rC = 24f * density // Coin radius match
+                
+                // Draw drop shadow / outer halo
+                drawCircle(
+                    color = strokeColor.copy(alpha = 0.3f),
+                    radius = rC + 4.dp.toPx(),
+                    center = Offset(coin.x, coin.y)
+                )
+                // Draw inner solid coin
+                drawCircle(
+                    color = coinColor,
+                    radius = rC,
+                    center = Offset(coin.x, coin.y)
+                )
+                // Draw outer border ring
+                drawCircle(
+                    color = strokeColor,
+                    radius = rC,
+                    center = Offset(coin.x, coin.y),
+                    style = Stroke(width = 2.dp.toPx())
+                )
+                
+                // If this is the active AI best shot target, draw an animated glowing neon selector circle around it!
+                val bestShotRef = activeBestShot
+                if (bestShotRef != null && bestShotRef.coinPos != null) {
+                    val distToTarget = kotlin.math.sqrt((coin.x - bestShotRef.coinPos.x) * (coin.x - bestShotRef.coinPos.x) + (coin.y - bestShotRef.coinPos.y) * (coin.y - bestShotRef.coinPos.y))
+                    if (distToTarget < 15f) {
+                        // targeted anim ring
+                        val pulseRad = rC + (10f + 6f * sin(System.currentTimeMillis() / 150f)).dp.toPx()
+                        drawCircle(
+                            color = Color(0xFF00E676),
+                            radius = pulseRad,
+                            center = Offset(coin.x, coin.y),
+                            style = Stroke(width = 2.5.dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 8f), 0f))
+                        )
+                    }
+                }
+            }
+
+            // ================= LEFT HUD PLAYER TEAM OVERVIEW INDICATOR =================
+            // Positioned dynamically along the left middle edge overlay background
+            val hudY = (handleTLY + handleBRY) / 2f
+            
+            // Draw a semi-transparent HUD pill backing
+            drawRoundRect(
+                color = Color.Black.copy(alpha = 0.72f),
+                topLeft = Offset(handleTLX + 8.dp.toPx(), hudY - 50.dp.toPx()),
+                size = androidx.compose.ui.geometry.Size(60.dp.toPx(), 80.dp.toPx()),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(10.dp.toPx(), 10.dp.toPx())
+            )
+            
+            val iconCenter = Offset(handleTLX + 38.dp.toPx(), hudY + 5.dp.toPx())
+            val indicatorColor = if (leftIndicatorActiveTeam == "WHITE") Color(0xFFECEFF1) else Color(0xFF263238)
+            val indicatorStroke = if (leftIndicatorActiveTeam == "WHITE") Color.White else Color.Black
+            
+            // Draw glowing halo around active team coin representing user's current color
+            drawCircle(
+                color = Color(0xFF00FFCC).copy(alpha = 0.45f),
+                radius = 16.dp.toPx(),
+                center = iconCenter
+            )
+            drawCircle(
+                color = indicatorColor,
+                radius = 11.dp.toPx(),
+                center = iconCenter
+            )
+            drawCircle(
+                color = indicatorStroke,
+                radius = 11.dp.toPx(),
+                center = iconCenter,
+                style = Stroke(width = 1.5.dp.toPx())
+            )
+            
+            // Tiny label status dot
+            drawCircle(
+                color = Color(0xFF00FFCC),
+                radius = 3.dp.toPx(),
+                center = Offset(handleTLX + 38.dp.toPx(), hudY - 22.dp.toPx())
+            )
 
             if (!isAutoSuggestEnabled) {
                 // =============== MANUAL AIMING MODE ===============
@@ -1579,6 +1759,140 @@ class CarromOverlayService : Service() {
 
                                 Divider(color = Color.White.copy(alpha = 0.08f))
 
+                                // User Team Designation Selector
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(
+                                        text = "Config My Team Color:",
+                                        color = Color.White.copy(alpha = 0.7f),
+                                        fontSize = 10.5.sp
+                                    )
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        listOf("WHITE", "BLACK").forEach { team ->
+                                            val isSel = leftIndicatorActiveTeam == team
+                                            Box(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .clip(RoundedCornerShape(8.dp))
+                                                    .background(if (isSel) Color(0xFF00FFCC).copy(alpha = 0.22f) else Color.White.copy(alpha = 0.08f))
+                                                    .border(1.dp, if (isSel) Color(0xFF00FFCC) else Color.Transparent, RoundedCornerShape(8.dp))
+                                                    .clickable {
+                                                        leftIndicatorActiveTeam = team
+                                                        activeFilterColor = team // Synchronize solver filter with designated team automatically!
+                                                        suggestionStatusText = "Solving exclusively for $team Coins! 🎯"
+                                                    }
+                                                    .padding(vertical = 5.dp),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Text(
+                                                    text = if (team == "WHITE") "⚪ My White Coins" else "⚫ My Black Coins",
+                                                    color = if (isSel) Color.White else Color.LightGray,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Divider(color = Color.White.copy(alpha = 0.08f))
+
+                                // Board Coin Editor Interface
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Overlay Coin Placer Mode",
+                                            color = Color.White,
+                                            fontSize = 11.5.sp,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                        Switch(
+                                            checked = isCoinEditMode,
+                                            onCheckedChange = { 
+                                                isCoinEditMode = it
+                                                if (isCoinEditMode) {
+                                                    suggestionStatusText = "Placer active! TAP screen background to place/delete coins."
+                                                } else {
+                                                    suggestionStatusText = "Placer disabled. Pass-through touches enabled."
+                                                }
+                                            },
+                                            colors = SwitchDefaults.colors(
+                                                checkedThumbColor = Color(0xFF00FFCC),
+                                                checkedTrackColor = Color(0xFF00FFCC).copy(alpha = 0.3f),
+                                            ),
+                                            modifier = Modifier.scale(0.7f)
+                                        )
+                                    }
+
+                                    if (isCoinEditMode) {
+                                        // Placed coin spawn type selector: WHITE, BLACK, RED
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "Color to place:",
+                                                color = Color.White.copy(alpha = 0.6f),
+                                                fontSize = 9.5.sp,
+                                                modifier = Modifier.weight(1.1f)
+                                            )
+                                            listOf("WHITE", "BLACK", "RED", "ALL").forEach { col ->
+                                                val isSelected = activeFilterColor == col
+                                                val indicatorColor = when(col) {
+                                                    "WHITE" -> Color.White
+                                                    "BLACK" -> Color.LightGray
+                                                    "RED" -> Color(0xFFFF5252)
+                                                    else -> Color(0xFF00E5FF)
+                                                }
+                                                Box(
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .clip(RoundedCornerShape(6.dp))
+                                                        .background(if (isSelected) indicatorColor.copy(alpha = 0.25f) else Color.White.copy(alpha = 0.05f))
+                                                        .border(1.dp, if (isSelected) indicatorColor else Color.Transparent, RoundedCornerShape(6.dp))
+                                                        .clickable {
+                                                            activeFilterColor = col
+                                                        }
+                                                        .padding(vertical = 4.dp),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Text(
+                                                        text = col,
+                                                        color = if (isSelected) Color.White else Color.Gray,
+                                                        fontSize = 8.5.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        // Clear all coins button to quickly reset custom layout
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(26.dp)
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(Color(0xFFFF5252).copy(alpha = 0.2f))
+                                                .clickable {
+                                                    activeBoardCoins.clear()
+                                                    suggestionStatusText = "Cleared all custom coins!"
+                                                },
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text("Clear Custom Placed Coins 🧹", color = Color(0xFFFF8A80), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+
+                                Divider(color = Color.White.copy(alpha = 0.08f))
+
                                 // DYNAMIC LIVE SHOT STATS HUD
                                 Row(
                                     modifier = Modifier
@@ -1803,5 +2117,12 @@ class OverlayShot(
     val score: Float,
     val description: String,
     val contactPoint: androidx.compose.ui.geometry.Offset,
-    val cutAngle: Float
+    val cutAngle: Float,
+    val coinPos: androidx.compose.ui.geometry.Offset? = null
+)
+
+data class CustomBoardCoin(
+    val x: Float,
+    val y: Float,
+    val colorType: String // "WHITE", "BLACK", "RED"
 )
